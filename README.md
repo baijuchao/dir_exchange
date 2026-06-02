@@ -1,32 +1,22 @@
-function [Yout, info] = local_hist_contrast_y(Y, tileRows, tileCols, clipLimit, maxGain)
-    % Y 域局部直方图增强 / 简化 CLAHE
+function [Yout, info] = local_hist_contrast_y_shadow(Y, tileRows, tileCols, clipLimit, maxAddCode, maxGain)
+    % 暗区优先的 Y 域局部直方图增强
     %
-    % Y:
-    %   输入亮度，范围 0~255
+    % 目标：
+    % 1. 暗区和中暗区明显提亮
+    % 2. 亮区和高光尽量不动
+    % 3. 避免 CLAHE 把亮区增强得太夸张
     %
-    % tileRows, tileCols:
-    %   tile 数量，比如 8, 8
-    %
-    % clipLimit:
-    %   直方图裁剪强度，建议 0.003 ~ 0.015
-    %
-    % maxGain:
-    %   最大亮度增益，建议 1.6 ~ 2.5
-    %
-    % 输出：
-    %   Yout: 增强后的亮度
-    %   info: 调试信息
+    % 推荐参数：
+    % [Yc, info] = local_hist_contrast_y_shadow(Y, 8, 8, 0.006, 60, 2.4);
 
     Y = double(Y);
     [h, w] = size(Y);
 
     Yu8 = uint8(min(max(round(Y), 0), 255));
 
-    % 每个 tile 的尺寸
     tileH = ceil(h / tileRows);
     tileW = ceil(w / tileCols);
 
-    % 保存每个 tile 的 LUT，大小：tileRows x tileCols x 256
     LUT = zeros(tileRows, tileCols, 256);
 
     for tr = 1:tileRows
@@ -38,12 +28,11 @@ function [Yout, info] = local_hist_contrast_y(Y, tileRows, tileCols, clipLimit, 
             c2 = min(tc * tileW, w);
 
             tile = Yu8(r1:r2, c1:c2);
-
             LUT(tr, tc, :) = build_clahe_lut(tile, clipLimit);
         end
     end
 
-    % 对每个像素，根据所在 tile 周围 4 个 LUT 做双线性插值
+    % 先得到普通 CLAHE 的映射结果
     Yeq = zeros(h, w);
 
     for r = 1:h
@@ -78,43 +67,52 @@ function [Yout, info] = local_hist_contrast_y(Y, tileRows, tileCols, clipLimit, 
         end
     end
 
-    % gain 限幅，避免暗部被局部直方图暴力拉亮
-    gain = Yeq ./ max(Y, 1.0);
-    gain = min(max(gain, 1.0 / maxGain), maxGain);
+    Yn = Y / 255.0;
 
-    Yout = Y .* gain;
-    Yout = min(max(Yout, 0), 255);
+    % 暗区权重：
+    % 0~0.45 主要作用，0.45~0.75 逐渐减弱，亮区基本不动。
+    shadowWeight = 1.0 - smoothstep(0.45, 0.75, Yn);
+
+    % 黑位保护：
+    % 避免纯黑、近黑被直接抬成灰雾。
+    blackProtect = smoothstep(0.015, 0.06, Yn);
+
+    % 高光保护：
+    % 亮区不允许被 CLAHE 明显增强。
+    highlightProtect = 1.0 - smoothstep(0.70, 0.95, Yn);
+
+    weight = shadowWeight .* blackProtect .* highlightProtect;
+    weight = min(max(weight, 0), 1);
+
+    % 只使用 CLAHE 的正向提亮，不让它压暗暗区。
+    claheDelta = max(Yeq - Y, 0);
+
+    % 如果局部直方图没有明显抬暗区，用一个暗部 lift 作为兜底。
+    % sqrt(Y)-Y 在暗部增量最大，高亮区自然变小。
+    liftCurve = (sqrt(max(Yn, 0)) - Yn) * 255.0;
+
+    % 暗区提亮量：CLAHE 和 lift 取较强者。
+    delta = max(claheDelta, 0.75 * liftCurve);
+
+    % 只在暗区混合，亮区被 weight 压住。
+    delta = delta .* weight;
+
+    % 限制最大加亮幅度，避免暗部噪声被拉爆。
+    delta = min(delta, maxAddCode);
+
+    candidate = Y + delta;
+
+    % 再限制最大增益。暗像素可以抬，但不能无限放大。
+    candidate = min(candidate, max(Y * maxGain, Y + 1.0));
+
+    Yout = min(max(candidate, 0), 255);
 
     info.Yeq = Yeq;
-    info.gain = gain;
+    info.shadowWeight = shadowWeight;
+    info.blackProtect = blackProtect;
+    info.highlightProtect = highlightProtect;
+    info.weight = weight;
+    info.claheDelta = claheDelta;
+    info.liftCurve = liftCurve;
     info.delta = Yout - Y;
-end  
-
-
-function lut = build_clahe_lut(tile, clipLimit)
-    % 为单个 tile 构建 CLAHE LUT
-
-    tile = double(tile(:));
-    numPixels = numel(tile);
-
-    histVals = zeros(256, 1);
-
-    for i = 1:numPixels
-        bin = tile(i) + 1;
-        histVals(bin) = histVals(bin) + 1;
-    end
-
-    % clipLimit 是归一化比例，转成每个 bin 的最大计数
-    clipCount = max(1, clipLimit * numPixels);
-
-    excess = sum(max(histVals - clipCount, 0));
-    histVals = min(histVals, clipCount);
-
-    % 把被裁剪掉的计数平均分回所有 bin
-    histVals = histVals + excess / 256;
-
-    cdf = cumsum(histVals);
-    cdf = cdf / cdf(end);
-
-    lut = cdf * 255;
 end

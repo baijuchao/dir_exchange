@@ -1,55 +1,41 @@
-function [Yout, info] = auto_dark_tone_y(Y, blackPct, whitePct, gammaValue, targetP90, maxGain)
-    % 面向极暗 8bit 图的自动暗光 tone 模块
+function [rgbOut, info] = auto_exposure_rgb_double(rgbIn, targetP90, maxGain, blackPoint)
+    % 线性 RGB double 自动曝光
     %
-    % 作用：
-    % 1. 用百分位黑白点拉开动态范围
-    % 2. 用 gamma 提亮暗部
-    % 3. 把 p90 推到目标亮度
-    % 4. 限制最大增益，避免噪声无限放大
+    % rgbIn:
+    %   线性 RGB，范围建议 0~1
     %
-    % 推荐：
-    % [Y_tone, info] = auto_dark_tone_y(Y, 0.5, 99.5, 0.55, 180, 8.0);
+    % targetP90:
+    %   目标 p90 亮度，比如 0.35~0.65
+    %
+    % maxGain:
+    %   最大数字增益，比如 4~16
+    %
+    % blackPoint:
+    %   黑位，比如 0.0~0.02
 
-    Y = double(Y);
+    rgb = double(rgbIn);
 
-    black = prctile(Y(:), blackPct);
-    white = prctile(Y(:), whitePct);
+    R = rgb(:, :, 1);
+    G = rgb(:, :, 2);
+    B = rgb(:, :, 3);
 
-    if white - black < 5
-        white = black + 5;
-    end
+    Y = 0.299 * R + 0.587 * G + 0.114 * B;
 
-    % 1. 百分位动态范围拉伸
-    X = (Y - black) / (white - black);
-    X = min(max(X, 0), 1);
+    Ycorr = max(Y - blackPoint, 0);
 
-    % 2. gamma 提亮
-    Xg = X .^ gammaValue;
+    p90 = prctile(Ycorr(:), 90);
 
-    % 3. 自动曝光：把 p90 推到 targetP90
-    p90 = prctile(Xg(:), 90);
-    target = targetP90 / 255.0;
-
-    gain = target / max(p90, 1e-4);
+    gain = targetP90 / max(p90, 1e-8);
     gain = min(max(gain, 1.0), maxGain);
 
-    Xe = Xg * gain;
+    rgbOut = max(rgb - blackPoint, 0) * gain + blackPoint;
 
-    % 4. 高光 shoulder，防止拉伸后高光直接炸白
-    shoulder = 0.8;
-    Xe = Xe ./ (1.0 + shoulder * Xe);
+    % 线性域暂时允许超过 1，后面的 tone curve 可以压高光。
+    % 如果你没有高光压缩模块，也可以 clamp 到 1。
+    rgbOut = max(rgbOut, 0);
 
-    % 归一化，让 1 仍接近 1
-    whiteNorm = gain / (1.0 + shoulder * gain);
-    Xe = Xe / max(whiteNorm, 1e-6);
-
-    Yout = min(max(Xe, 0), 1) * 255.0;
-
-    info.black = black;
-    info.white = white;
+    info.p90 = p90;
     info.gain = gain;
-    info.X = X;
-    info.Xg = Xg;
-    info.Yout = Yout;
-    info.delta = Yout - Y;
+    info.blackPoint = blackPoint;
+    info.targetP90 = targetP90;
 end

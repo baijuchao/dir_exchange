@@ -1,66 +1,55 @@
-function [Yout, info] = dark_region_lift_y(Y, liftStrength, shadowEnd, blackPoint, maxAddCode)
-    % 专门的 Y 域暗区提亮模块
+function [Yout, info] = auto_dark_tone_y(Y, blackPct, whitePct, gammaValue, targetP90, maxGain)
+    % 面向极暗 8bit 图的自动暗光 tone 模块
     %
-    % Y:
-    %   输入亮度，0~255
+    % 作用：
+    % 1. 用百分位黑白点拉开动态范围
+    % 2. 用 gamma 提亮暗部
+    % 3. 把 p90 推到目标亮度
+    % 4. 限制最大增益，避免噪声无限放大
     %
-    % liftStrength:
-    %   提亮强度，建议 0.8~2.0
-    %
-    % shadowEnd:
-    %   暗区结束位置，0~1，例如 0.65 表示 65% 以下都可被提亮
-    %
-    % blackPoint:
-    %   黑位保护，0~1，例如 0.02~0.08
-    %
-    % maxAddCode:
-    %   每个像素最大加亮码值，建议 60~140
-    %
-    % 推荐第一组：
-    % [Y_lift, info] = dark_region_lift_y(Y, 1.35, 0.75, 0.03, 110);
+    % 推荐：
+    % [Y_tone, info] = auto_dark_tone_y(Y, 0.5, 99.5, 0.55, 180, 8.0);
 
     Y = double(Y);
-    Yn = Y / 255.0;
 
-    % 1. 暗区权重：
-    %    低亮度位置权重大，高于 shadowEnd 后逐渐变 0。
-    shadowWeight = 1.0 - smoothstep(blackPoint, shadowEnd, Yn);
-    shadowWeight = min(max(shadowWeight, 0), 1);
+    black = prctile(Y(:), blackPct);
+    white = prctile(Y(:), whitePct);
 
-    % 2. 黑位保护：
-    %    纯黑附近不直接抬，避免黑底变灰。
-    blackProtect = smoothstep(0.0, blackPoint, Yn);
-    blackProtect = min(max(blackProtect, 0), 1);
+    if white - black < 5
+        white = black + 5;
+    end
 
-    % 3. 强暗部 lift 曲线：
-    %    log 曲线在暗部增量更明显，比 gamma/sqrt 更直接。
-    %
-    %    liftCurveNorm 范围大约 0~1，暗部贡献更强。
-    liftCurveNorm = log(1.0 + liftStrength * (1.0 - Yn)) / log(1.0 + liftStrength);
+    % 1. 百分位动态范围拉伸
+    X = (Y - black) / (white - black);
+    X = min(max(X, 0), 1);
 
-    % 4. 暗部基础加亮量：
-    %    越暗，加得越多；接近 shadowEnd 时被 shadowWeight 压下去。
-    delta = maxAddCode * liftCurveNorm .* shadowWeight .* blackProtect;
+    % 2. gamma 提亮
+    Xg = X .^ gammaValue;
 
-    % 5. 可选：暗区纹理保护。
-    %    有细节的暗区多提，极平坦暗区略少提，避免噪声和黑底浮起来。
-    localMean = box_mean(Yn, 7);
-    localMeanSq = box_mean(Yn.^2, 7);
-    localVar = max(localMeanSq - localMean.^2, 0);
-    textureLike = normalize01(sqrt(localVar), 98.0);
+    % 3. 自动曝光：把 p90 推到 targetP90
+    p90 = prctile(Xg(:), 90);
+    target = targetP90 / 255.0;
 
-    textureGate = 0.65 + 0.35 * textureLike;
-    delta = delta .* textureGate;
+    gain = target / max(p90, 1e-4);
+    gain = min(max(gain, 1.0), maxGain);
 
-    % 6. 应用提亮。
-    Yout = Y + delta;
-    Yout = min(max(Yout, 0), 255);
+    Xe = Xg * gain;
 
-    info.shadowWeight = shadowWeight;
-    info.blackProtect = blackProtect;
-    info.liftCurveNorm = liftCurveNorm;
-    info.textureLike = textureLike;
-    info.textureGate = textureGate;
-    info.delta = Yout - Y;
+    % 4. 高光 shoulder，防止拉伸后高光直接炸白
+    shoulder = 0.8;
+    Xe = Xe ./ (1.0 + shoulder * Xe);
+
+    % 归一化，让 1 仍接近 1
+    whiteNorm = gain / (1.0 + shoulder * gain);
+    Xe = Xe / max(whiteNorm, 1e-6);
+
+    Yout = min(max(Xe, 0), 1) * 255.0;
+
+    info.black = black;
+    info.white = white;
+    info.gain = gain;
+    info.X = X;
+    info.Xg = Xg;
     info.Yout = Yout;
+    info.delta = Yout - Y;
 end

@@ -1,18 +1,14 @@
-function [rgbOut, info] = adaptive_dark_scurve_rgb(rgbIn)
-    % 自适应暗光 S 曲线 tone mapping，RGB 输入版本
+function [rgbOut, info] = advanced_contrast_rgb(rgbIn)
+    % 高级亮度域对比度增强
     %
-    % 输入：
+    % 输入:
     %   rgbIn: 0~1 double RGB
     %
-    % 输出：
+    % 输出:
     %   rgbOut: 0~1 double RGB
     %
-    % 设计目标：
-    %   1. 暗区明显提亮
-    %   2. S 曲线 pivot 跟随图像直方图，而不是固定 0.5
-    %   3. 暗部幂函数只作用在暗区
-    %   4. 保护相对亮区 p70~p95 的纹理细节
-    %   5. 通过亮度比例缩放 RGB，尽量避免偏色
+    % 核心:
+    %   多尺度 CLAHE 只作用在亮度 Y 上，再用 ratio 回乘 RGB。
 
     rgb = min(max(double(rgbIn), 0), 1);
 
@@ -20,155 +16,160 @@ function [rgbOut, info] = adaptive_dark_scurve_rgb(rgbIn)
     G = rgb(:, :, 2);
     B = rgb(:, :, 3);
 
-    % 使用 BT.601 亮度作为 tone 控制通道
-    Yin = 0.299 * R + 0.587 * G + 0.114 * B;
-    Yin = min(max(Yin, 0), 1);
+    Y = 0.299 * R + 0.587 * G + 0.114 * B;
+    Y = min(max(Y, 0), 1);
 
-    % 统计当前图像主体亮度分布
-    p01 = prctile(Yin(:), 1);
-    p10 = prctile(Yin(:), 10);
-    p40 = prctile(Yin(:), 40);
-    p50 = prctile(Yin(:), 50);
-    p70 = prctile(Yin(:), 70);
-    p90 = prctile(Yin(:), 90);
-    p95 = prctile(Yin(:), 95);
-    p99 = prctile(Yin(:), 99);
+    % 多尺度 CLAHE
+    % 小 tile 增强局部细节，大 tile 增强大尺度层次。
+    [YclaheSmall, infoSmall] = clahe_y_custom(Y, 8, 8, 0.006);
+    [YclaheLarge, infoLarge] = clahe_y_custom(Y, 16, 16, 0.004);
 
-    % S 曲线中点跟随暗图主体范围。
-    % 你的例子 p10=0.052, p90=0.408，则 pivot 约 0.23。
-    pivot = 0.5 * (p10 + p90);
+    % 混合两个尺度
+    Yclahe = 0.65 * YclaheSmall + 0.35 * YclaheLarge;
 
-    % slope 不要太大，否则 p70~p95 斜率容易被压低，亮区纹理会丢。
-    slope = 3.2;
+    % 避免 CLAHE 过度改变高光，加入亮区保护
+    highlightMask = smoothstep(0.75, 0.98, Y);
 
-    S = 1 ./ (1 + exp(-slope * (Yin - pivot)));
+    % 高光区域更多保留原始 Y
+    highlightProtectAmount = 0.45;
+    Ytarget = Yclahe .* (1 - highlightProtectAmount * highlightMask) + ...
+              Y .* (highlightProtectAmount * highlightMask);
 
-    S0 = 1 / (1 + exp(-slope * (0 - pivot)));
-    S1 = 1 / (1 + exp(-slope * (1 - pivot)));
+    % 暗区不要无限拉，避免噪声爆
+    ratio = Ytarget ./ max(Y, 1e-5);
 
-    Ysc = (S - S0) / max(S1 - S0, 1e-6);
-    Ysc = min(max(Ysc, 0), 1);
+    % 根据亮度自适应限制增益：
+    % 暗部允许较大增益，中间调适中，高光接近 1。
+    maxGainShadow = 3.0;
+    maxGainMid = 1.8;
+    maxGainHigh = 1.15;
 
-    % 暗部幂函数增强。
-    % gammaDark < 1 会抬暗部。
-    gammaDark = 0.62;
-    Ypow = Yin .^ gammaDark;
+    shadowMask = 1.0 - smoothstep(0.10, 0.35, Y);
+    highMask = smoothstep(0.70, 0.95, Y);
+    midMask = 1.0 - shadowMask - highMask;
+    midMask = min(max(midMask, 0), 1);
 
-    % 暗部 mask 只覆盖暗区和中暗区。
-    % 不要让它影响 p70~p90，否则相对亮区纹理容易被压平。
-    darkMask = 1.0 - smoothstep(p40, p75_safe(p70, p90), Yin);
-    darkMask = min(max(darkMask, 0), 1);
+    maxGainMap = maxGainShadow * shadowMask + ...
+                 maxGainMid * midMask + ...
+                 maxGainHigh * highMask;
 
-    % 黑位保护，避免接近 0 的区域被直接抬成灰雾。
-    blackProtect = smoothstep(max(p01, 0.002), max(p10, 0.01), Yin);
-    darkMask = darkMask .* blackProtect;
-
-    % 混合 S 曲线和暗部幂函数。
-    % darkPowerAmount 越大，暗区越亮。
-    darkPowerAmount = 0.70;
-    Ytone = Ysc .* (1 - darkPowerAmount * darkMask) + ...
-            Ypow .* (darkPowerAmount * darkMask);
-
-    % 保护相对亮区的纹理细节。
-    % 你的 p90 只有 0.408，所以这里的“亮区”不是 0.8 以上，
-    % 而是当前图像分布里的 p70~p95。
-    brightMask = smoothstep(p70, p95, Yin);
-
-    % 线性参考用于保留相对亮区的亮度层次。
-    Ylinear = (Yin - p01) / max(p99 - p01, 1e-6);
-    Ylinear = min(max(Ylinear, 0), 1);
-
-    brightPreserveAmount = 0.28;
-    Ytone = Ytone .* (1 - brightPreserveAmount * brightMask) + ...
-            Ylinear .* (brightPreserveAmount * brightMask);
-
-    % 再加一点亮区局部细节回灌，修复 tone 后亮区纹理变糊的问题。
-    base = blur_gaussian(Yin, 15, 3.0);
-    detail = Yin - base;
-
-    detailRestoreAmount = 0.22;
-    Ytone = Ytone + detailRestoreAmount * brightMask .* detail;
-
-    Ytone = min(max(Ytone, 0), 1);
-
-    % 用亮度比例缩放 RGB，避免 R/G/B 分别 tone 造成偏色。
-    ratio = Ytone ./ max(Yin, 1e-5);
-
-    % 限制 ratio，避免极暗像素被无限放大导致彩噪/色斑。
-    ratio = min(max(ratio, 0.25), 8.0);
+    ratio = min(max(ratio, 0.5), maxGainMap);
 
     rgbOut = rgb .* ratio;
     rgbOut = min(max(rgbOut, 0), 1);
 
-    info.Yin = Yin;
-    info.Ysc = Ysc;
-    info.Ypow = Ypow;
-    info.Ytone = Ytone;
+    info.Y = Y;
+    info.YclaheSmall = YclaheSmall;
+    info.YclaheLarge = YclaheLarge;
+    info.Yclahe = Yclahe;
+    info.Ytarget = Ytarget;
     info.ratio = ratio;
-    info.darkMask = darkMask;
-    info.brightMask = brightMask;
-    info.detail = detail;
-    info.p01 = p01;
-    info.p10 = p10;
-    info.p40 = p40;
-    info.p50 = p50;
-    info.p70 = p70;
-    info.p90 = p90;
-    info.p95 = p95;
-    info.p99 = p99;
-    info.pivot = pivot;
-    info.slope = slope;
+    info.highlightMask = highlightMask;
+    info.maxGainMap = maxGainMap;
+    info.infoSmall = infoSmall;
+    info.infoLarge = infoLarge;
 end
 
+
+function [Yout, info] = clahe_y_custom(Y, tileRows, tileCols, clipLimit)
+    % 自定义 Y 域 CLAHE，输入输出 0~1
+
+    Y = min(max(double(Y), 0), 1);
+    [h, w] = size(Y);
+
+    Yu8 = uint8(round(Y * 255));
+
+    tileH = ceil(h / tileRows);
+    tileW = ceil(w / tileCols);
+
+    LUT = zeros(tileRows, tileCols, 256);
+
+    for tr = 1:tileRows
+        for tc = 1:tileCols
+            r1 = (tr - 1) * tileH + 1;
+            r2 = min(tr * tileH, h);
+
+            c1 = (tc - 1) * tileW + 1;
+            c2 = min(tc * tileW, w);
+
+            tile = Yu8(r1:r2, c1:c2);
+            LUT(tr, tc, :) = build_clahe_lut(tile, clipLimit);
+        end
+    end
+
+    Yeq = zeros(h, w);
+
+    for r = 1:h
+        tileY = (r - 0.5) / tileH + 0.5;
+        tr0 = floor(tileY);
+        tr1 = tr0 + 1;
+        wy = tileY - tr0;
+
+        tr0 = min(max(tr0, 1), tileRows);
+        tr1 = min(max(tr1, 1), tileRows);
+
+        for c = 1:w
+            tileX = (c - 0.5) / tileW + 0.5;
+            tc0 = floor(tileX);
+            tc1 = tc0 + 1;
+            wx = tileX - tc0;
+
+            tc0 = min(max(tc0, 1), tileCols);
+            tc1 = min(max(tc1, 1), tileCols);
+
+            bin = double(Yu8(r, c)) + 1;
+
+            v00 = LUT(tr0, tc0, bin);
+            v01 = LUT(tr0, tc1, bin);
+            v10 = LUT(tr1, tc0, bin);
+            v11 = LUT(tr1, tc1, bin);
+
+            top = (1 - wx) * v00 + wx * v01;
+            bot = (1 - wx) * v10 + wx * v11;
+
+            Yeq(r, c) = (1 - wy) * top + wy * bot;
+        end
+    end
+
+    Yout = min(max(Yeq / 255.0, 0), 1);
+
+    info.tileRows = tileRows;
+    info.tileCols = tileCols;
+    info.clipLimit = clipLimit;
+    info.Yeq = Yout;
+end
+
+
+function lut = build_clahe_lut(tile, clipLimit)
+    % 为单个 tile 构建 CLAHE LUT
+
+    tile = double(tile(:));
+    numPixels = numel(tile);
+
+    histVals = zeros(256, 1);
+
+    for i = 1:numPixels
+        bin = tile(i) + 1;
+        histVals(bin) = histVals(bin) + 1;
+    end
+
+    % clipLimit 是相对比例，转成每个 bin 最大计数
+    clipCount = max(1, clipLimit * numPixels);
+
+    excess = sum(max(histVals - clipCount, 0));
+    histVals = min(histVals, clipCount);
+
+    % 裁剪掉的数量均匀分回所有 bin
+    histVals = histVals + excess / 256;
+
+    cdf = cumsum(histVals);
+    cdf = cdf / max(cdf(end), 1e-6);
+
+    lut = cdf * 255;
+end
 
 function y = smoothstep(edge0, edge1, x)
     t = (x - edge0) / max(edge1 - edge0, 1e-6);
     t = min(max(t, 0), 1);
     y = t .* t .* (3.0 - 2.0 * t);
-end
-
-function p75 = p75_safe(p70, p90)
-    % 给暗部幂函数 mask 一个安全结束点。
-    % 不让暗部增强拖到 p90，保护相对亮区纹理。
-    p75 = p70 + 0.35 * (p90 - p70);
-end
-
-function out = blur_gaussian(img, kernelSize, sigma)
-    kernel = gaussian_kernel(kernelSize, sigma);
-    out = conv2_custom(img, kernel);
-end
-
-function kernel = gaussian_kernel(kernelSize, sigma)
-    radius = floor(kernelSize / 2);
-    [xx, yy] = meshgrid(-radius:radius, -radius:radius);
-    kernel = exp(-(xx.^2 + yy.^2) / (2.0 * sigma * sigma));
-    kernel = kernel / sum(kernel(:));
-end
-
-function out = conv2_custom(img, kernel)
-    [kh, kw] = size(kernel);
-    py = floor(kh / 2);
-    px = floor(kw / 2);
-    padded = pad_reflect(img, py, px);
-    out = conv2(padded, kernel, 'valid');
-end
-
-function padded = pad_reflect(img, py, px)
-    [h, w] = size(img);
-    rowIdx = reflect_indices(1 - py:h + py, h);
-    colIdx = reflect_indices(1 - px:w + px, w);
-    padded = img(rowIdx, colIdx);
-end
-
-function idx = reflect_indices(idx, n)
-    if n == 1
-        idx = ones(size(idx));
-        return;
-    end
-
-    period = 2 * n - 2;
-    idx = mod(idx - 1, period) + 1;
-
-    over = idx > n;
-    idx(over) = period - idx(over) + 2;
 end
